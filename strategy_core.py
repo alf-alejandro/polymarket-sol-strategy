@@ -1,18 +1,26 @@
 """
 strategy_core.py — Market discovery + order book metrics + signal engine
+
+Configurable via env vars:
+  SYMBOL = SOL | BTC   (default: SOL)
 """
 
+import os
 import time
 import requests
 from datetime import datetime, timezone
 from collections import deque
 from py_clob_client.client import ClobClient
 
-CLOB_HOST    = "https://clob.polymarket.com"
-GAMMA_API    = "https://gamma-api.polymarket.com"
-SLOT_ORIGIN  = 1771778100   # known slot anchor (Feb 22 2026)
-SLOT_STEP    = 300          # 5 minutes
-TOP_LEVELS   = 15
+CLOB_HOST   = "https://clob.polymarket.com"
+GAMMA_API   = "https://gamma-api.polymarket.com"
+SLOT_ORIGIN = 1771778100   # slot anchor compartido SOL y BTC (Feb 22 2026)
+SLOT_STEP   = 300          # 5 minutos
+TOP_LEVELS  = 15
+
+SYMBOL      = os.environ.get("SYMBOL", "SOL").upper()
+SLUG_PREFIX = "btc-updown-5m" if SYMBOL == "BTC" else "sol-updown-5m"
+MARKET_NAME = "Bitcoin" if SYMBOL == "BTC" else "Solana"
 
 
 # ── Market discovery ──────────────────────────────────────────────────────────
@@ -82,12 +90,13 @@ def find_active_sol_market() -> dict | None:
     """
     Try current slot ± neighbors to find a market whose order book
     actually responds (200 OK). Prioritizes accepting_orders=True.
+    Works for SOL and BTC via SLUG_PREFIX.
     """
     base = get_current_slot_ts()
     # Try offsets 0, 1, 2, -1 (prefer current and future slots)
     for offset in [0, 1, 2, -1]:
         ts   = base + offset * SLOT_STEP
-        slug = f"sol-updown-5m-{ts}"
+        slug = f"{SLUG_PREFIX}-{ts}"
         gm   = fetch_gamma_market(slug)
         if not gm:
             continue
