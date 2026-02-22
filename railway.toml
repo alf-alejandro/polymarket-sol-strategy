@@ -8,6 +8,6 @@ restartPolicyMaxRetries = 5
 
 [env]
 OBI_THRESHOLD = "0.15"
-WINDOW_SIZE   = "8"
-POLL_INTERVAL = "3"
+WINDOW_SIZE   = "20"
+POLL_INTERVAL = "1"
 DATA_DIR      = "/data"
