@@ -1,0 +1,254 @@
+"""
+app.py — FastAPI server: WebSocket broadcast + strategy background loop
+"""
+
+import asyncio
+import json
+import logging
+import os
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("strategy")
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+
+from strategy_core import (
+    find_active_sol_market,
+    get_order_book_metrics,
+    compute_signal,
+    seconds_remaining,
+    fetch_clob_market,
+    build_market_info,
+    fetch_gamma_market,
+    get_current_slot_ts,
+    SLOT_STEP,
+)
+from simulator import Portfolio
+
+# ── Config ────────────────────────────────────────────────────────────────────
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
+OBI_THRESHOLD = float(os.environ.get("OBI_THRESHOLD", "0.15"))
+WINDOW_SIZE   = int(os.environ.get("WINDOW_SIZE", "8"))
+PORT          = int(os.environ.get("PORT", "8000"))
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+connected: set[WebSocket] = set()
+
+state: dict = {
+    "market":    {},
+    "orderbook": {},
+    "signal":    {},
+    "portfolio": {},
+    "config":    {
+        "threshold":     OBI_THRESHOLD,
+        "window_size":   WINDOW_SIZE,
+        "poll_interval": POLL_INTERVAL,
+        "initial_capital": 100.0,
+        "trade_pct":     0.02,
+    },
+    "status":    "initializing",
+    "error":     None,
+}
+
+
+# ── WebSocket broadcast ───────────────────────────────────────────────────────
+
+async def broadcast(data: dict):
+    dead: set[WebSocket] = set()
+    for ws in connected.copy():
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.add(ws)
+    connected.difference_update(dead)
+
+
+# ── Strategy loop ─────────────────────────────────────────────────────────────
+
+async def strategy_loop():
+    portfolio   = Portfolio()
+    obi_window  = deque(maxlen=WINDOW_SIZE)
+    market_info = None
+    snap        = 0
+    last_market_id = None
+
+    while True:
+        try:
+            # ── Find / refresh market ─────────────────────────────────────────
+            if market_info is None:
+                state["status"] = "searching"
+                await broadcast(state)
+                log.info("Searching for active SOL 5min market...")
+                market_info = await asyncio.to_thread(find_active_sol_market)
+                if market_info is None:
+                    state["error"] = "No active SOL market found. Retrying in 15s..."
+                    log.warning("No market found, retrying in 15s")
+                    await asyncio.sleep(15)
+                    continue
+                state["error"] = None
+                log.info(f"Found market: {market_info['question']}")
+
+            # ── Detect new market cycle ───────────────────────────────────────
+            if market_info["condition_id"] != last_market_id:
+                last_market_id = market_info["condition_id"]
+                obi_window.clear()
+                snap = 0
+                log.info(f"New market cycle: {market_info['question']}")
+                # Close any open trade (market expired)
+                if portfolio.active_trade:
+                    up_p   = market_info["up_price"]
+                    down_p = market_info["down_price"]
+                    portfolio.close_trade(up_p, down_p)
+
+            # ── Get order book ────────────────────────────────────────────────
+            snap += 1
+            ob, err = await asyncio.to_thread(
+                get_order_book_metrics, market_info["up_token_id"]
+            )
+
+            if err or ob is None:
+                # 404 means market expired → find next slot
+                if err and ("404" in str(err) or "No orderbook" in str(err)):
+                    if portfolio.active_trade:
+                        portfolio.close_trade(
+                            market_info["up_price"],
+                            market_info["down_price"],
+                        )
+                    market_info = None
+                    state["status"] = "searching"
+                    state["error"]  = "Mercado expirado, buscando siguiente..."
+                    await broadcast(state)
+                    await asyncio.sleep(6)
+                else:
+                    state["status"] = "error"
+                    state["error"]  = err or "Empty order book"
+                    await broadcast(state)
+                    await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            # Update market prices
+            market_info["up_price"]   = ob["vwap_mid"]
+            market_info["down_price"] = round(1 - ob["vwap_mid"], 4)
+            obi_window.append(ob["obi"])
+
+            # ── Signal ────────────────────────────────────────────────────────
+            signal = compute_signal(ob["obi"], list(obi_window), OBI_THRESHOLD)
+
+            # ── Simulation ────────────────────────────────────────────────────
+            secs_left = seconds_remaining(market_info)
+
+            # Try entering a trade
+            if secs_left is not None and secs_left > 60:
+                entered = portfolio.consider_entry(
+                    signal,
+                    market_info["question"],
+                    market_info["up_price"],
+                    market_info["down_price"],
+                )
+
+            # Close trade when market is about to end
+            if secs_left is not None and secs_left < 10 and portfolio.active_trade:
+                portfolio.close_trade(
+                    market_info["up_price"],
+                    market_info["down_price"],
+                )
+
+            # Detect market expiry → search next
+            if secs_left is not None and secs_left <= 0:
+                market_info = None
+                await asyncio.sleep(5)
+                continue
+
+            # ── Refresh accepting_orders status ───────────────────────────────
+            if snap % 5 == 0:
+                fresh = await asyncio.to_thread(
+                    fetch_clob_market, market_info["condition_id"]
+                )
+                if fresh:
+                    market_info["accepting_orders"] = bool(fresh.get("accepting_orders"))
+
+            # ── Build state snapshot ──────────────────────────────────────────
+            portfolio_stats = portfolio.stats(
+                market_info["up_price"],
+                market_info["down_price"],
+            )
+
+            state["status"]    = "running"
+            state["error"]     = None
+            state["snapshot"]  = snap
+            state["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            state["market"]    = {
+                **market_info,
+                "seconds_remaining": round(secs_left, 1) if secs_left is not None else None,
+            }
+            state["orderbook"] = ob
+            state["signal"]    = signal
+            state["portfolio"] = portfolio_stats
+
+            await broadcast(state)
+
+        except Exception as exc:
+            log.exception(f"Strategy loop error: {exc}")
+            state["status"] = "error"
+            state["error"]  = str(exc)
+            market_info = None  # force re-search on next iteration
+            await broadcast(state)
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+# ── App lifespan ──────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(strategy_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app       = FastAPI(title="Polymarket SOL Strategy", lifespan=lifespan)
+templates = Jinja2Templates(directory="templates")
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/api/state")
+async def get_state():
+    return state
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected.add(websocket)
+    # Send current state immediately
+    try:
+        await websocket.send_json(state)
+        while True:
+            # Keep connection alive; client sends pings
+            await asyncio.wait_for(websocket.receive_text(), timeout=30)
+    except (WebSocketDisconnect, asyncio.TimeoutError, Exception):
+        connected.discard(websocket)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, log_level="warning")
