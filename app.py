@@ -32,6 +32,7 @@ from strategy_core import (
     SLOT_STEP,
 )
 from simulator import Portfolio
+import db as database
 
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
@@ -74,7 +75,18 @@ async def broadcast(data: dict):
 # ── Strategy loop ─────────────────────────────────────────────────────────────
 
 async def strategy_loop():
-    portfolio   = Portfolio()
+    # Restaurar portafolio desde DB
+    saved     = database.load_state()
+    portfolio = Portfolio(
+        initial_capital = saved["initial_capital"],
+        db              = database,
+    )
+    portfolio.restore(saved)
+    log.info(
+        f"Portafolio restaurado: capital=${portfolio.capital:.2f}, "
+        f"trades históricos={len(portfolio.closed_trades)}"
+    )
+
     obi_window  = deque(maxlen=WINDOW_SIZE)
     market_info = None
     snap        = 0
@@ -209,6 +221,9 @@ async def strategy_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Inicializar DB antes de arrancar el loop
+    database.init_db()
+    log.info(f"DB path: {database.db_path()}")
     task = asyncio.create_task(strategy_loop())
     yield
     task.cancel()
@@ -232,6 +247,19 @@ async def dashboard(request: Request):
 @app.get("/api/state")
 async def get_state():
     return state
+
+
+@app.get("/api/trades")
+async def get_all_trades():
+    """Historial completo de trades desde la DB (útil para análisis externo)."""
+    saved = await asyncio.to_thread(database.load_state)
+    return {
+        "capital":       saved["capital"],
+        "initial_capital": saved["initial_capital"],
+        "total_trades":  saved["trade_counter"],
+        "trades":        [t.to_dict() for t in saved["closed_trades"]],
+        "db_path":       database.db_path(),
+    }
 
 
 @app.websocket("/ws")

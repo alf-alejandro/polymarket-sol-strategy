@@ -10,3 +10,4 @@ restartPolicyMaxRetries = 5
 OBI_THRESHOLD = "0.15"
 WINDOW_SIZE   = "8"
 POLL_INTERVAL = "3"
+DATA_DIR      = "/data"

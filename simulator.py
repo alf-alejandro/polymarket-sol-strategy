@@ -67,7 +67,8 @@ class Trade:
 
 
 class Portfolio:
-    def __init__(self, initial_capital: float = INITIAL_CAPITAL, trade_pct: float = TRADE_PCT):
+    def __init__(self, initial_capital: float = INITIAL_CAPITAL, trade_pct: float = TRADE_PCT,
+                 db=None):
         self.initial_capital  = initial_capital
         self.capital          = initial_capital
         self.trade_pct        = trade_pct
@@ -75,8 +76,17 @@ class Portfolio:
         self.closed_trades: list[Trade] = []
         self.pnl_history: list[float]   = [0.0]
         self._trade_counter = 0
+        self._db = db  # módulo db para persistencia (opcional)
         # For entry confirmation
         self._signal_streak: dict = {"label": None, "count": 0}
+
+    def restore(self, saved: dict) -> None:
+        """Restaura el estado desde la DB al arrancar el servidor."""
+        self.capital         = saved["capital"]
+        self.initial_capital = saved["initial_capital"]
+        self.pnl_history     = saved["pnl_history"]
+        self._trade_counter  = saved["trade_counter"]
+        self.closed_trades   = saved["closed_trades"]
 
     # ── Entry logic ────────────────────────────────────────────────────────────
 
@@ -131,6 +141,9 @@ class Portfolio:
             entry_time   = datetime.utcnow().strftime("%H:%M:%S"),
         )
         self._signal_streak = {"label": None, "count": 0}
+        # Persistir trade abierto
+        if self._db:
+            self._db.save_trade(self.active_trade)
         return True
 
     # ── Mark-to-market ─────────────────────────────────────────────────────────
@@ -179,6 +192,14 @@ class Portfolio:
         total_pnl = round(self.capital - self.initial_capital, 4)
         self.pnl_history.append(round(total_pnl, 4))
 
+        # Persistir trade cerrado + estado del portafolio
+        if self._db:
+            self._db.save_trade(trade)
+            self._db.save_portfolio_state(
+                self.capital, self.initial_capital,
+                self.pnl_history, self._trade_counter,
+            )
+
         return trade
 
     def cancel_active_trade(self):
@@ -187,6 +208,12 @@ class Portfolio:
             return
         self.active_trade.status = "CANCELLED"
         self.closed_trades.append(self.active_trade)
+        if self._db:
+            self._db.save_trade(self.active_trade)
+            self._db.save_portfolio_state(
+                self.capital, self.initial_capital,
+                self.pnl_history, self._trade_counter,
+            )
         self.active_trade = None
 
     # ── Stats ──────────────────────────────────────────────────────────────────
