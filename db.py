@@ -16,7 +16,29 @@ import threading
 
 log = logging.getLogger("db")
 
-DATA_DIR = os.environ.get("DATA_DIR", "./data")
+def _resolve_data_dir() -> str:
+    """
+    Resuelve el directorio de datos con fallback seguro.
+    Railway con Volume: /data  (persistente)
+    Sin Volume / local: ./data (efímero pero no crashea)
+    """
+    candidate = os.environ.get("DATA_DIR", "/data")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        # Verificar que es escribible
+        test = os.path.join(candidate, ".write_test")
+        with open(test, "w") as f:
+            f.write("ok")
+        os.remove(test)
+        return candidate
+    except OSError:
+        fallback = "./data"
+        os.makedirs(fallback, exist_ok=True)
+        log.warning(f"DATA_DIR '{candidate}' no escribible, usando fallback: {fallback}")
+        return fallback
+
+
+DATA_DIR = _resolve_data_dir()
 DB_PATH  = os.path.join(DATA_DIR, "portfolio.db")
 
 _lock = threading.Lock()
@@ -26,7 +48,6 @@ _conn: sqlite3.Connection | None = None
 def _get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        os.makedirs(DATA_DIR, exist_ok=True)
         _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _conn.execute("PRAGMA journal_mode=WAL")   # mejor concurrencia
         _conn.execute("PRAGMA synchronous=NORMAL") # buen balance durabilidad/velocidad
