@@ -129,6 +129,7 @@ class Portfolio:
         if entry_price <= 0.01:
             return False
 
+        self.capital = round(self.capital - bet_size, 4)  # debitar bet del capital
         shares = round(bet_size / entry_price, 4)
         self._trade_counter += 1
         self.active_trade = Trade(
